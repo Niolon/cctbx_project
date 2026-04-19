@@ -13,6 +13,142 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional, Any, List
 import numpy as np
+from scipy.constants import (
+    hbar, 
+    h as planck_const,
+    k as k_B, 
+    c as speed_of_light
+)
+
+
+_K_TO_CM1 = k_B / (planck_const * speed_of_light * 100)   # Boltzmann in cm⁻¹/K
+
+def compute_mode_sensitivity(
+    frequencies: np.ndarray,
+    eigenvectors: np.ndarray,
+    masses: np.ndarray,
+    temperature: float,
+    weights: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Compute ADP sensitivity dU/dω for each phonon mode.
+    
+    The ADP formula is:
+        U(ω) = A × (1/ω) × coth(ℏω/2kT)
+        
+    where A = (ℏ/2M) × |e|²
+    
+    The sensitivity (derivative with respect to frequency) is:
+        dU/dω = -A/ω² × [coth(x) + x × csch²(x)]
+        
+    where:
+        x = ℏω/2kT
+        csch(x) = 1/sinh(x)
+    
+    This quantifies how much ADP changes per unit frequency change:
+    - High |dU/dω|: mode strongly constrained by ADP data
+    - Low |dU/dω|: mode weakly constrained, refinement uncertain
+    
+    Physics:
+    - Low frequency (ℏω << kT): dU/dω ~ -1/ω³ (highly sensitive)
+    - High frequency (ℏω >> kT): dU/dω ~ -1/ω² (quantum saturated)
+    
+    Args:
+        frequencies: Mode frequencies in cm⁻¹ (n_modes,)
+        eigenvectors: Mode eigenvectors (n_modes, n_atoms, 3)
+        masses: Atomic masses in amu (n_atoms,)
+        temperature: Temperature in Kelvin
+        weights: Optional q-point weights (n_modes,). If None, all weights = 1
+        
+    Returns:
+        mode_sensitivities: (n_modes,) array of |dU/dω| magnitudes in SI units
+        
+    Reference:
+        ADR-013, equations for sensitivity analysis
+    """
+    # Convert frequencies from cm⁻¹ to rad/s
+    # cm⁻¹ to Hz: ν(Hz) = ν(cm⁻¹) × c(m/s) × 100
+    # Hz to rad/s: ω = 2π × ν
+    freqs_hz = frequencies * speed_of_light * 100
+    freqs_rad = 2 * np.pi * freqs_hz
+    
+    n_modes = len(frequencies)
+    n_atoms = len(masses)
+    
+    if weights is None:
+        weights = np.ones(n_modes)
+    
+    # Compute sensitivity per mode
+    mode_sensitivities = np.zeros(n_modes)
+    
+    for mode_idx in range(n_modes):
+        omega = freqs_rad[mode_idx]
+        
+        # Skip near-zero frequencies (acoustic modes at Γ after clamping)
+        if omega < 1e-10:
+            mode_sensitivities[mode_idx] = 0.0
+            continue
+        
+        # Compute quantum factor: x = ℏω/2kT
+        x = hbar * omega / (2 * k_B * temperature)
+        
+        # Compute derivative factor: coth(x) + x × csch²(x)
+        if x > 50:  # High frequency limit: coth(x) ≈ 1, csch²(x) ≈ 0
+            coth_x = 1.0
+            csch2_x = 0.0
+        else:
+            coth_x = 1.0 / np.tanh(x)
+            sinh_x = np.sinh(x)
+            csch2_x = 1.0 / (sinh_x * sinh_x)
+        
+        # dU/dω = -A/ω² × [coth(x) + x × csch²(x)]
+        # Take absolute value for sensitivity magnitude
+        derivative_factor = abs(coth_x + x * csch2_x) / (omega * omega)
+        
+        # Sum sensitivity over all atoms at this q-point/mode
+        total_sensitivity = 0.0
+        for atom_idx in range(n_atoms):
+            e = eigenvectors[mode_idx, atom_idx, :]  # (3,) eigenvector
+            M = masses[atom_idx] * 1.66053906660e-27  # amu to kg
+            
+            # A = (ℏ/2M) × |e|²
+            amplitude_sq = np.sum(np.abs(e)**2)
+            A = (hbar / (2 * M)) * amplitude_sq
+            
+            # Sensitivity for this atom
+            sensitivity = A * derivative_factor
+            total_sensitivity += sensitivity
+        
+        # Weight by q-point multiplicity
+        mode_sensitivities[mode_idx] = total_sensitivity * weights[mode_idx]
+    
+    return mode_sensitivities
+
+
+def thermal_cutoff_cm1(temperature_K: float, factor: float = 2.0) -> float:
+    """
+    Compute physics-based high-frequency cutoff for NoMoRe refinement.
+    
+    Modes with ℏω >> kT have negligible thermal occupation and contribute
+    only zero-point energy to ADPs. These can be fixed at DFT/MLIP values.
+    
+    Args:
+        temperature_K: Temperature in Kelvin.
+        factor: Multiples of kT for cutoff (default 2.0, recommended 2-4).
+            - factor=2: n(ω)≈16% thermal occupation
+            - factor=4: n(ω)≈2% thermal occupation  
+            - factor=6: n(ω)≈0.2% thermal occupation
+    
+    Returns:
+        Frequency cutoff in cm⁻¹.
+    
+    Example:
+        >>> thermal_cutoff_cm1(100)  # 100K
+        139.5  # 2*kT in cm⁻¹
+        >>> thermal_cutoff_cm1(100, factor=4)
+        279.0  # 4*kT in cm⁻¹
+    """
+    return factor * temperature_K * _K_TO_CM1
 
 
 @dataclass
@@ -291,22 +427,20 @@ class ThermalCutoffStrategy(FixedThresholdStrategy):
         self.n_refined = None
         # Don't set limits yet - need temperature from compute_groups()
     
-    def compute_groups(self, phonon_data, pre_groups: Optional[List[List[int]]] = None) -> RefinementGroups:
+    def compute_groups(self, phonon_data, temperature, pre_groups: Optional[List[List[int]]] = None) -> RefinementGroups:
         """
         Compute thermal limits and assign groups.
         
         If pre_groups provided, applies thermal thresholds to group-averaged frequencies.
         """
         # Get temperature from phonon_data or raise error
-        temperature = getattr(phonon_data, 'temperature', None)
-        if temperature is None:
-            raise ValueError("ThermalCutoffStrategy requires temperature in phonon_data")
-        
-        from nomore_ase.utils import units
+        #temperature = getattr(phonon_data, 'temperature', None)
+        #if temperature is None:
+        #    raise ValueError("ThermalCutoffStrategy requires temperature in phonon_data")
         
         # Compute frequency limits from kT
-        self.medium_limit = units.thermal_cutoff_cm1(temperature, self.medium_factor)
-        self.high_limit = units.thermal_cutoff_cm1(temperature, self.high_factor)
+        self.medium_limit = thermal_cutoff_cm1(temperature, self.medium_factor)
+        self.high_limit = thermal_cutoff_cm1(temperature, self.high_factor)
         
         # Call parent's grouping logic with pre_groups
         groups = super().compute_groups(phonon_data, pre_groups)
@@ -350,7 +484,7 @@ class SensitivityBasedStrategy(FrequencyPartitionStrategy):
         self.low_threshold = low_threshold
         self.high_threshold = high_threshold
     
-    def compute_groups(self, phonon_data, pre_groups: Optional[List[List[int]]] = None) -> RefinementGroups:
+    def compute_groups(self, phonon_data, temperature, pre_groups: Optional[List[List[int]]] = None) -> RefinementGroups:
         """
         Assign groups based on ADP sensitivity analysis.
         
@@ -360,7 +494,6 @@ class SensitivityBasedStrategy(FrequencyPartitionStrategy):
         frequencies = phonon_data.frequencies_cm1
         eigenvectors = phonon_data.eigenvectors
         masses = phonon_data.masses
-        temperature = getattr(phonon_data, 'temperature', None)
         weights = phonon_data.weights
         
         # Validate required inputs
@@ -368,9 +501,7 @@ class SensitivityBasedStrategy(FrequencyPartitionStrategy):
             raise ValueError(
                 "SensitivityBasedStrategy requires eigenvectors, masses, and temperature"
             )
-        
-        from nomore_ase.core.sensitivity_utils import compute_mode_sensitivity
-        
+                
         # Compute per-mode ADP sensitivity
         sensitivities = compute_mode_sensitivity(
             frequencies, eigenvectors, masses, temperature, weights

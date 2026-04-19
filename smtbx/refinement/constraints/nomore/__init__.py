@@ -30,7 +30,11 @@ import smtbx.refinement.constraints as _sc
 import smtbx.refinement.least_squares
 
 from .phonon_data import PhononData
-from .frequency_partition import FrequencyPartitionStrategy
+from .frequency_partition import (
+    FrequencyPartitionStrategy, SensitivityBasedStrategy, ThermalCutoffStrategy
+)
+from .geometry import build_atom_mapping_periodic
+
 
 # ---------------------------------------------------------------------------
 # Physical constant: ADP amplitude factor for cm⁻¹ arithmetic
@@ -66,59 +70,40 @@ class PhononADPConstraint:
 
     Args:
         phonon_data:         PhononData (eigenvectors, masses, frequencies_cm1, …)
-        temperature:         Temperature in Kelvin.
         partition_strategy:  FrequencyPartitionStrategy that assigns modes to
                              refinement groups.
-        xray_structure:      cctbx xray.structure (ASU).  The constraint will
-                             update scatterer u_star values in-place; the
-                             caller is responsible for sharing this object with
-                             any least-squares machinery that needs to see the
-                             updated ADPs.
+
+    Note:
+        Temperature and xray_structure are obtained from the reparametrisation
+        object in add_to().  Call add_to() before using update_structure() or
+        any method that computes ADPs.
     """
 
     def __init__(
         self,
         phonon_data: PhononData,
-        temperature: float,
         partition_strategy: FrequencyPartitionStrategy,
-        xray_structure,
     ) -> None:
         self.phonon_data = phonon_data
-        self.temperature = temperature
-        self._structure = xray_structure
-        self._unit_cell = xray_structure.unit_cell()
-        self._n_asu_atoms = xray_structure.scatterers().size()
+        self.partition_strategy = partition_strategy
 
-        self._initial_frequencies_cm1 = phonon_data.frequencies_cm1.copy()
+        frequencies = phonon_data.frequencies_cm1.copy()
+        frequencies[frequencies < 10.0] = 10.0
+        self._initial_frequencies_cm1 = frequencies
         self.n_modes = len(self._initial_frequencies_cm1)
         self.n_q = len(phonon_data.q_points)
 
-        # Compute partition groups
-        self._groups = partition_strategy.compute_groups(phonon_data)
-        # Sorted unique active group IDs → determines parameter ordering
-        self._active_group_ids = np.array(
-            sorted(set(self._groups.group_ids[self._groups.group_ids >= 0]))
-        )
-        self.n_parameters = len(self._active_group_ids)
-
-        # Build crystallographic geometry mappings once
-        p1_structure = xray_structure.expand_to_p1(sites_mod_positive=True)
-        self._p1_to_asu = self._build_p1_to_asu(xray_structure, p1_structure)
-        self._phonon_to_p1 = self._build_phonon_to_p1(phonon_data, p1_structure)
-
-        # Pre-compute mode tensors directly in ASU space: (N_modes, N_asu, 3, 3).
-        # Folds the phonon→P1 reordering and P1→ASU rotation/averaging into
-        # a single precomputed tensor so all runtime operations work in ASU
-        # space without allocating a P1-sized intermediate.
-        self._mode_tensors = self._precompute_asu_mode_tensors(
-            phonon_data.eigenvectors, phonon_data.masses
-        )
-
-        # Current scale factors (mutable state, start at 1.0)
-        self.current_scales = np.ones(self.n_parameters)
-
         # Populated in add_to()
         self._scale_params: list = []
+
+        # Deferred until add_to() — set to None so callers get a clear error
+        self.temperature = None
+        self._structure = None
+        self._unit_cell = None
+        self._n_asu_atoms = None
+        self._p1_to_asu = None
+        self._phonon_to_p1 = None
+        self._mode_tensors = None
 
     # ------------------------------------------------------------------
     # smtbx constraint protocol
@@ -127,21 +112,51 @@ class PhononADPConstraint:
     @property
     def constrained_parameters(self) -> tuple:
         """All ASU atom U parameters are governed by this constraint."""
+        if self._n_asu_atoms is None:
+            return ()
         return tuple((i, 'U') for i in range(self._n_asu_atoms))
 
     def add_to(self, reparametrisation) -> None:
         """
         Register in the reparametrisation.
 
-        Registers one independent_scalar_parameter per active partition group
-        (scale factor, initial value 1.0, variable=True) and updates the
-        scatterer U_star values from the initial frequencies.
+        Obtains temperature and xray_structure from the reparametrisation,
+        builds all crystallographic geometry mappings, pre-computes ASU mode
+        tensors, updates scatterer U_star values from initial frequencies, and
+        registers one independent_scalar_parameter per active partition group.
 
         Note: U_star parameters remain independent in smtbx (variable=True)
         because we apply the freq→U Jacobian chain rule in Python after
         build_up().  The scale-factor parameters are registered for
         bookkeeping and future C++ integration.
         """
+        xray_structure = reparametrisation.structure
+        self.temperature = reparametrisation.temperature
+        self._structure = xray_structure
+        self._unit_cell = xray_structure.unit_cell()
+        self._n_asu_atoms = xray_structure.scatterers().size()
+
+        # Build crystallographic geometry mappings
+        p1_structure = xray_structure.expand_to_p1(sites_mod_positive=True)
+        self._p1_to_asu = self._build_p1_to_asu(xray_structure, p1_structure)
+        self._phonon_to_p1 = self._build_phonon_to_p1(self.phonon_data, p1_structure)
+
+        # Pre-compute mode tensors directly in ASU space: (N_modes, N_asu, 3, 3).
+        self._mode_tensors = self._precompute_asu_mode_tensors(
+            self.phonon_data.eigenvectors, self.phonon_data.masses
+        )
+
+        # Compute partition groups
+        self._groups = self.partition_strategy.compute_groups(self.phonon_data, self.temperature)
+        # Sorted unique active group IDs → determines parameter ordering
+        self._active_group_ids = np.array(
+            sorted(set(self._groups.group_ids[self._groups.group_ids >= 0]))
+        )
+        self.n_parameters = len(self._active_group_ids)
+
+        # Current scale factors (mutable state, start at 1.0)
+        self.current_scales = np.ones(self.n_parameters)
+
         # Update structure to match initial frequencies (scale = 1.0)
         self.update_structure(self.current_scales)
 
@@ -175,8 +190,6 @@ class PhononADPConstraint:
             u = u_cart_asu[i]
             u_tuple = (u[0, 0], u[1, 1], u[2, 2], u[0, 1], u[0, 2], u[1, 2])
             sc.u_star = adptbx.u_cart_as_u_star(self._unit_cell, u_tuple)
-            sc.flags.set_use_u_aniso(True)
-            sc.flags.set_use_u_iso(False)
 
         self.current_scales = np.asarray(scale_factors, dtype=float).copy()
 
@@ -258,7 +271,7 @@ class PhononADPConstraint:
         T_p /= masses[np.newaxis, :, np.newaxis, np.newaxis]
 
         # Rotate to ASU frame: T_r[m,k] = R_k^T @ T_p[m,k] @ R_k
-        T_r = np.einsum('kab,mkbc,kcd->mkad', R_mats, T_p, R_mats)
+        T_r = np.einsum('kba,mkbc,kcd->mkad', R_mats, T_p, R_mats)
 
         # Scatter-add contributions to ASU atoms, then average
         tensors = np.zeros((n_modes, n_asu, 3, 3))
@@ -307,7 +320,6 @@ class PhononADPConstraint:
         Map phonon atom order → CCTBX P1 atom order.
         Returns None when sizes don't match (P1 structure assumed already ordered).
         """
-        from nomore_ase.utils.geometry import build_atom_mapping_periodic
 
         p1_scatterers = list(p1_structure.scatterers())
         if len(phonon_data.positions_frac) != len(p1_scatterers):
@@ -404,124 +416,3 @@ class PhononADPConstraint:
             jac[:, param_idx] = tensors_flat[mode_indices].T @ sensitivity / self.n_q
 
         return jac
-
-
-# ---------------------------------------------------------------------------
-
-class NoMoReRefinement:
-    """
-    smtbx-backed NoMoRe refinement in partition-parameter space.
-
-    Builds the normal equations for χ²(scale_factors) by:
-        1. Updating U_star from scale factors via PhononADPConstraint
-        2. Calling smtbx build_up() → dχ²/dU_star
-        3. Chain-ruling to dχ²/d(scale_factors) via the constraint Jacobian
-
-    This is mathematically equivalent to building the normal equations
-    directly in scale-factor space, i.e.
-        N = (∂U/∂s)ᵀ W (∂U/∂s)
-    where W is smtbx's weighting operator.
-
-    Args:
-        xray_structure:      cctbx xray.structure (ASU).
-        reflections:         Miller array with F² observations.
-        phonon_data:         PhononData.
-        temperature:         Temperature in Kelvin.
-        partition_strategy:  FrequencyPartitionStrategy.
-        weighting_scheme:    "unit" | "sigma" | "shelx".
-        shelx_a, shelx_b:    Optional SHELX weighting parameters.
-        tsc_path:            Optional path to .tsc aspheric form-factor file.
-    """
-
-    def __init__(
-        self,
-        xray_structure,
-        reflections,
-        phonon_data: PhononData,
-        temperature: float,
-        partition_strategy: FrequencyPartitionStrategy,
-        weighting_scheme: str = "unit",
-        shelx_a: Optional[float] = None,
-        shelx_b: Optional[float] = None,
-        tsc_path: Optional[str] = None,
-    ) -> None:
-        self.phonon_data = phonon_data
-        self.temperature = temperature
-
-        from nomore_ase.crystallography.smtbx_adapter import SmtbxAdapter
-        self._smtbx = SmtbxAdapter(
-            xray_structure,
-            reflections,
-            weighting_scheme=weighting_scheme,
-            shelx_a=shelx_a,
-            shelx_b=shelx_b,
-            phonon_data=phonon_data,
-            tsc_path=tsc_path,
-        )
-
-        # Constraint operates on the same deep-copied xray.structure as the LS
-        # object, so update_structure() changes are immediately visible to smtbx.
-        self.constraint = PhononADPConstraint(
-            phonon_data=phonon_data,
-            temperature=temperature,
-            partition_strategy=partition_strategy,
-            xray_structure=self._smtbx.structure,
-        )
-
-        # Apply initial ADPs so the structure is consistent before the first call
-        self.constraint.update_structure(self.constraint.current_scales)
-        self._smtbx._init_ls()
-
-    # ------------------------------------------------------------------
-    # Main interface
-    # ------------------------------------------------------------------
-
-    @property
-    def n_parameters(self) -> int:
-        """Number of refinement parameters (active partition groups)."""
-        return self.constraint.n_parameters
-
-    @property
-    def initial_scales(self) -> np.ndarray:
-        """Initial scale-factor vector (all ones)."""
-        return np.ones(self.n_parameters)
-
-    def compute_gradient(
-        self, scale_factors: np.ndarray
-    ) -> tuple[float, np.ndarray]:
-        """
-        Build normal equations and return χ² and dχ²/d(scale_factors).
-
-        Args:
-            scale_factors: (N_groups,) current scale factors.
-
-        Returns:
-            chi_sq:     Reduced χ².
-            grad:       (N_groups,) gradient of χ² w.r.t. scale factors.
-        """
-        # Update U_star in the shared structure
-        self.constraint.update_structure(scale_factors)
-        # Re-synchronise the smtbx LS object (picks up changed U_star)
-        self._smtbx._init_ls()
-
-        # Build normal equations; get χ² and dχ²/dU_cart_asu
-        chi_sq, grad_u_cart_asu = self._smtbx.compute_gradients()
-
-        # Chain rule: dχ²/ds_g = dχ²/dU_cart_asu · ∂U_cart_asu/∂s_g
-        grad = self.constraint.gradient_wrt_scales(grad_u_cart_asu)
-        return chi_sq, grad
-
-    def objective(self, scale_factors: np.ndarray) -> float:
-        """Return χ² only (no gradient computation beyond what smtbx needs)."""
-        self.constraint.update_structure(scale_factors)
-        self._smtbx._init_ls()
-        self._smtbx.ls.build_up()
-        return self._smtbx.ls.objective()
-
-    def quality_indicators(self) -> dict:
-        """Return R1, wR2, GooF, chi_sq, n_reflections for current structure."""
-        return self._smtbx.get_quality_indicators()
-
-    def current_frequencies(self) -> np.ndarray:
-        """Return current N_modes frequencies implied by constraint state."""
-        return self.constraint.current_frequencies()
