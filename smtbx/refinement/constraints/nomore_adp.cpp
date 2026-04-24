@@ -1,4 +1,5 @@
 #include <smtbx/refinement/constraints/nomore_adp.h>
+#include <scitbx/constants.h>
 
 namespace smtbx { namespace refinement { namespace constraints {
 
@@ -6,7 +7,58 @@ void nomore_u_star::linearise(
   uctbx::unit_cell const &unit_cell,
   sparse_matrix_type *jacobian_transpose
 ) {
-    
+  // variables
+  const double SPEED_OF_LIGHT = 29979245800 ; // cm s^-1
+  const double PLANCK_REDUCED = 1.054571817e-34 ; // J s
+  const double H_BAR_C = PLANCK_REDUCED * SPEED_OF_LIGHT ; // J cm
+  const double BOLTZMANN = 1.380649e-23 ; // J K^-1
+  const double H_BAR_C_DIV_KB = H_BAR_C / BOLTZMANN ; // J K
+  const double AMU = 1.66053906660e-27;  // kg
+  const double U_FACTOR = PLANCK_REDUCED * 1e20 / (AMU * 2.0 * scitbx::constants::pi * SPEED_OF_LIGHT);
+
+  int n_asu = scatterers_.size();
+  for (int i_asu=0; i_asu < n_asu; ++i_asu) {
+    for (int i_uij=0; i_uij < 6; ++i_uij) {
+        u_stars_[i_asu][i_uij] = 0.0;
+    }
+  }
+
+  for (int i_mode=0; i_mode < n_modes_; ++i_mode) {
+    int i_group = group_ids_[i_mode];
+    double freq;
+    if (i_group >=0) {
+      freq = scale_params_[i_group]->value * initial_frequencies_[i_mode];
+    } else {
+      freq = initial_frequencies_[i_mode];
+    }
+
+    double bose_einstein_ex = std::exp(H_BAR_C_DIV_KB * freq / temperature_);
+    double bose_einstein_n = 1.0 / (bose_einstein_ex - 1.0);
+    double bose_einstein_e = H_BAR_C * freq * (0.5 + bose_einstein_n);
+    double amplitude = bose_einstein_e / (freq * freq) * U_FACTOR;
+
+    for (int i_asu=0; i_asu < n_asu; ++i_asu) {
+      for (int i_uij=0; i_uij < 6; ++i_uij) {
+        int i_mode_tensor = 6 * i_asu + i_uij + i_mode * n_asu * 6;
+        u_stars_[i_asu][i_uij] += amplitude * mode_tensors_ustar_[i_mode_tensor] / n_q_;
+      }
+    }
+
+    if (jacobian_transpose != NULL && i_group >= 0) {
+      sparse_matrix_type &jt = *jacobian_transpose;
+      double domega_dscale = initial_frequencies_[i_mode];
+      double dn_domega = H_BAR_C_DIV_KB / temperature_ * bose_einstein_ex / ((bose_einstein_ex -1) * (bose_einstein_ex -1));
+      double de_domega = H_BAR_C * (0.5 + bose_einstein_n + freq * dn_domega);
+      double da_domega = -2 * bose_einstein_e / (freq * freq * freq) + de_domega / (freq * freq);
+      double da_dscale = da_domega * U_FACTOR * domega_dscale;
+      for (int i_asu=0; i_asu < n_asu; ++i_asu) {
+        for (int i_uij=0; i_uij < 6; ++i_uij) {
+          int i_mode_tensor = 6 * i_asu + i_uij + i_mode * n_asu * 6;
+          jt(scale_params_[i_group]->index(), index() + i_asu*6 + i_uij) += da_dscale * mode_tensors_ustar_[i_mode_tensor] / n_q_;
+        }
+      }
+    }
+  }   
 }
 
 index_range nomore_u_star::component_indices_for(scatterer_type const *scatterer) const {
