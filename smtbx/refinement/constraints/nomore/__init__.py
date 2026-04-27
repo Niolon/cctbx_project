@@ -29,6 +29,7 @@ from cctbx import adptbx
 import smtbx.refinement.constraints as _sc
 import smtbx.refinement.least_squares
 from scitbx import matrix
+from scitbx.array_family import flex
 
 from .phonon_data import PhononData
 from .frequency_partition import (
@@ -177,14 +178,14 @@ class PhononADPConstraint:
             _sc.nomore_u_star,
             scatterers= reparametrisation.structure.scatterers(),
             scale_params = list(self._scale_params),
-            mode_tensors_ustar = list(self._mode_tensors),
-            initial_frequencies = list(self._initial_frequencies_cm1),
-            group_ids = list(self._groups.group_ids),
+            mode_tensors_ustar = flex.double(self._mode_tensors.tolist()),
+            initial_frequencies = flex.double(self._initial_frequencies_cm1.tolist),
+            group_ids = flex.int(self._groups.group_ids.to_list()),
             temperature = reparametrisation.temperature,
             n_modes=len(self._initial_frequencies_cm1),
             n_q = self.n_q
         )
-
+        
         for i_sc in range(self._n_asu_atoms):
             reparametrisation.asu_scatterer_parameters[i_sc].u = param
             reparametrisation.shared_Us[i_sc] = param
