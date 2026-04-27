@@ -19,9 +19,9 @@ namespace smtbx { namespace refinement { namespace constraints {
           init<
             af::shared<wt::scatterer_type *> const &,
             af::shared<independent_scalar_parameter*> const &, 
-            af::shared<double> const &,
-            af::shared<double> const &,
-            af::shared<int> const &,
+            af::const_ref<double> const &,
+            af::const_ref<double> const &,
+            af::const_ref<int> const &,
             double,
             int,
             int
