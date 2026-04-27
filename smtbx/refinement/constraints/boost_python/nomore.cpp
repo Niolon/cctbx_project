@@ -41,6 +41,12 @@ namespace smtbx { namespace refinement { namespace constraints {
       }
     };
     void wrap_nomore() {
+      {
+        using namespace scitbx::boost_python::container_conversions;
+        tuple_mapping_variable_capacity<af::shared<double> >();
+        tuple_mapping_variable_capacity<af::shared<int> >();
+        tuple_mapping_variable_capacity<af::shared<scalar_parameter *> >();
+      }
       nomore_wrapper::wrap();
     }
   }

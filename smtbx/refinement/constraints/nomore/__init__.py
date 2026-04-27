@@ -28,6 +28,7 @@ from typing import Optional
 from cctbx import adptbx
 import smtbx.refinement.constraints as _sc
 import smtbx.refinement.least_squares
+from scitbx import matrix
 
 from .phonon_data import PhononData
 from .frequency_partition import (
@@ -136,6 +137,12 @@ class PhononADPConstraint:
         self._unit_cell = xray_structure.unit_cell()
         self._n_asu_atoms = xray_structure.scatterers().size()
 
+        for sc in reparametrisation.structure.scatterers():
+            sc.flags.set_use_u_aniso(True)
+            sc.flags.set_grad_u_aniso(True)
+            sc.flags.set_use_u_iso(False)
+            sc.flags.set_grad_u_iso(False)
+
         # Build crystallographic geometry mappings
         p1_structure = xray_structure.expand_to_p1(sites_mod_positive=True)
         self._p1_to_asu = self._build_p1_to_asu(xray_structure, p1_structure)
@@ -157,66 +164,30 @@ class PhononADPConstraint:
         # Current scale factors (mutable state, start at 1.0)
         self.current_scales = np.ones(self.n_parameters)
 
-        # Update structure to match initial frequencies (scale = 1.0)
-        self.update_structure(self.current_scales)
-
-        # Register one scalar per group
         self._scale_params = []
-        for _ in self._active_group_ids:
+        for _, value in zip(self._active_group_ids, self.current_scales):
             param = reparametrisation.add(
                 _sc.independent_scalar_parameter,
-                value=1.0,
-                variable=True,
+                value=value,
+                variable=True
             )
             self._scale_params.append(param)
+        
+        param = reparametrisation.add(
+            _sc.nomore_u_star,
+            scatterers= reparametrisation.structure.scatterers(),
+            scale_params = list(self._scale_params),
+            mode_tensors_ustar = list(self._mode_tensors),
+            initial_frequencies = list(self._initial_frequencies_cm1),
+            group_ids = list(self._groups.group_ids),
+            temperature = reparametrisation.temperature,
+            n_modes=len(self._initial_frequencies_cm1),
+            n_q = self.n_q
+        )
 
-    # ------------------------------------------------------------------
-    # Structure update
-    # ------------------------------------------------------------------
-
-    def update_structure(self, scale_factors: np.ndarray) -> None:
-        """
-        Update ASU scatterer U_star values from scale factors.
-
-        Does NOT reinitialise the smtbx least-squares object; the caller
-        (NoMoReRefinement) is responsible for that.
-
-        Args:
-            scale_factors: (N_groups,) scale factors for active groups.
-        """
-        u_cart_asu = self._compute_u_cart_asu(scale_factors)
-
-        for i, sc in enumerate(self._structure.scatterers()):
-            u = u_cart_asu[i]
-            u_tuple = (u[0, 0], u[1, 1], u[2, 2], u[0, 1], u[0, 2], u[1, 2])
-            sc.u_star = adptbx.u_cart_as_u_star(self._unit_cell, u_tuple)
-
-        self.current_scales = np.asarray(scale_factors, dtype=float).copy()
-
-    # ------------------------------------------------------------------
-    # Gradient chain rule
-    # ------------------------------------------------------------------
-
-    def gradient_wrt_scales(self, grad_u_cart_asu_flat: np.ndarray) -> np.ndarray:
-        """
-        Transform dχ²/dU_cart_asu (from smtbx) to dχ²/d(scale_factors).
-
-        Applies the chain rule:
-            dχ²/ds_g = Σ_{i,j,k} (dχ²/dU_cart_asu_ijk) × (∂U_cart_asu_ijk/∂s_g)
-
-        Args:
-            grad_u_cart_asu_flat: (N_asu_atoms × 9,) gradient of χ² w.r.t.
-                                  U_cart for each ASU atom (row-major 3×3).
-
-        Returns:
-            grad_scales: (N_groups,) gradient in scale-factor space.
-        """
-        jac_asu = self._compute_jacobian_wrt_scales(self.current_scales)
-        return grad_u_cart_asu_flat @ jac_asu
-
-    # ------------------------------------------------------------------
-    # Scale ↔ frequency mapping
-    # ------------------------------------------------------------------
+        for i_sc in range(self._n_asu_atoms):
+            reparametrisation.asu_scatterer_parameters[i_sc].u = param
+            reparametrisation.shared_Us[i_sc] = param
 
     def scales_to_frequencies(self, scale_factors: np.ndarray) -> np.ndarray:
         """Convert N_groups scale factors to N_modes absolute frequencies."""
@@ -270,8 +241,11 @@ class PhononADPConstraint:
         T_p = np.einsum('mki,mkj->mkij', eigenvectors, eigenvectors.conj()).real
         T_p /= masses[np.newaxis, :, np.newaxis, np.newaxis]
 
-        # Rotate to ASU frame: T_r[m,k] = R_k^T @ T_p[m,k] @ R_k
-        T_r = np.einsum('kba,mkbc,kcd->mkad', R_mats, T_p, R_mats)
+        mat_f = np.array(matrix.sqr(self._unit_cell.fractionalization_matrix())).reshape(3,3)
+        rf_matrix = np.einsum('kab, bc -> kac', mat_f, R_mats)
+
+        # Rotate to ASU frame and convert to U*: T_r[m,k] = F^T R_k^T @ T_p[m,k] @ R_k F
+        T_r = np.einsum('kba,mkbc,kcd->mkad', rf_matrix, T_p, rf_matrix)
 
         # Scatter-add contributions to ASU atoms, then average
         tensors = np.zeros((n_modes, n_asu, 3, 3))
@@ -279,7 +253,10 @@ class PhononADPConstraint:
             tensors[:, k_asu] += T_r[:, ph_idx]
         tensors /= counts[np.newaxis, :, np.newaxis, np.newaxis]
 
-        return tensors
+        i = [0, 1, 2, 0, 0, 1]
+        j = [0, 1, 2, 1, 2, 2]
+
+        return np.ascontiguousarray(tensors[:,:,i,j].ravel())
 
     @staticmethod
     def _build_p1_to_asu(xray_structure, p1_structure) -> list:
@@ -310,7 +287,7 @@ class PhononADPConstraint:
                 if found:
                     break
             if not found:
-                logger.warning("P1 atom could not be mapped to ASU; using identity fallback")
+                print("P1 atom could not be mapped to ASU; using identity fallback")
                 mapping.append((0, np.eye(3)))
         return mapping
 
@@ -339,80 +316,3 @@ class PhononADPConstraint:
             source_elements=phonon_elements, target_elements=p1_elements,
         )
         return np.array(indices, dtype=int)
-
-    def _safe_frequencies(self, scale_factors: np.ndarray) -> np.ndarray:
-        """Return clamped working frequencies (handle acoustic / low-freq modes)."""
-        freqs = self.scales_to_frequencies(scale_factors)
-        working = freqs.copy()
-        working[working < 1.0] = _ACOUSTIC_INIT
-        return np.maximum(working, _MIN_FREQ)
-
-    def _bose_einstein(
-        self, freqs_cm1: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Bose-Einstein mode energy E = ω(0.5 + n) and its derivative dE/dω.
-
-        Returns:
-            E      (N_modes,)  mode energy in cm⁻¹
-            dE_dω  (N_modes,)  ∂E/∂ω
-        """
-        kt = max(self.temperature * _K_TO_CM1, 1e-6)
-        x = freqs_cm1 / kt
-        with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-            ex = np.exp(np.minimum(x, 500.0))   # clamp to avoid inf overflow
-            n = 1.0 / (ex - 1.0)
-            dn_dx = -ex / (ex - 1.0) ** 2
-
-        small = (x > 0) & (x < 1e-4)
-        n[small] = 1.0 / x[small] - 0.5
-        dn_dx[small] = -1.0 / x[small] ** 2
-
-        # High-T frozen limit: x >> 1 → n ≈ 0, dn/dx ≈ 0
-        large = x >= 500.0
-        n[large] = 0.0
-        dn_dx[large] = 0.0
-
-        zero = x <= 0
-        n[zero] = 0.0
-        dn_dx[zero] = 0.0
-
-        E = freqs_cm1 * (0.5 + n)
-        dE_dω = (0.5 + n) + freqs_cm1 * dn_dx / kt
-        return E, dE_dω
-
-    def _compute_u_cart_asu(self, scale_factors: np.ndarray) -> np.ndarray:
-        """Compute U_cart for all ASU atoms.  Shape: (N_asu, 3, 3)."""
-        ν = self._safe_frequencies(scale_factors)
-        E, _ = self._bose_einstein(ν)
-        amplitudes = E / ν ** 2 * _U_FACTOR       # (N_modes,)
-        u_cart = np.tensordot(amplitudes, self._mode_tensors, axes=([0], [0]))
-        return u_cart / self.n_q
-
-    def _compute_jacobian_wrt_scales(self, scale_factors: np.ndarray) -> np.ndarray:
-        """
-        Compute ∂U_cart_asu/∂s_g directly in ASU space.
-        Shape: (N_asu × 9, N_groups).
-
-        For each active group g:
-            ∂U_cart_asu[k]/∂s_g = Σ_{m ∈ group_g} (dA_m/dω_m) × ω_init_m × T_mk_asu / N_q
-
-        where dA/dω = _U_FACTOR × (dE/dω × ω − 2E) / ω³.
-        """
-        ν = self._safe_frequencies(scale_factors)
-        E, dE_dω = self._bose_einstein(ν)
-
-        # dA/dω = C × (dE/dω × ω − 2E) / ω³
-        dA_dν = _U_FACTOR * (dE_dω * ν - 2 * E) / ν ** 3   # (N_modes,)
-
-        n_asu = self._mode_tensors.shape[1]
-        tensors_flat = self._mode_tensors.reshape(self.n_modes, n_asu * 9)
-
-        jac = np.zeros((n_asu * 9, self.n_parameters))
-        for param_idx, group_id in enumerate(self._active_group_ids):
-            mode_indices = self._groups.get_group_modes(group_id)
-            # ∂ω_m/∂s_g = ω_init_m  (scale parameterisation)
-            sensitivity = dA_dν[mode_indices] * self._initial_frequencies_cm1[mode_indices]
-            jac[:, param_idx] = tensors_flat[mode_indices].T @ sensitivity / self.n_q
-
-        return jac
