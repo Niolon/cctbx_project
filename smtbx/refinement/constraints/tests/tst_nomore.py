@@ -42,26 +42,26 @@ scale1 = reparam.add(_sc.independent_scalar_parameter, value=1.0, variable=True)
 print(scale0)
 
 # 3. Add nomore_u_star
-# param = reparam.add(
-#     _sc.nomore_u_star,
-#     scatterers=tuple(xs.scatterers()),
-#     scale_params=(scale0, scale1),
-#     mode_tensors_ustar=mode_tensors,
-#     initial_frequencies=initial_frequencies,
-#     group_ids=group_ids,
-#     temperature=100.0,
-#     n_modes=n_modes,
-#     n_q=n_q
-# )
-
 param = reparam.add(
     _sc.nomore_u_star,
-    xs.scatterers(),
-    (scale0, scale1),
-    mode_tensors,
-    initial_frequencies,
-    group_ids,
-    100.0,
-    n_modes,
-    n_q
+    scatterers=tuple(xs.scatterers()),
+    scale_params=(scale0, scale1),
+    mode_tensors_ustar=mode_tensors,
+    initial_frequencies=initial_frequencies,
+    group_ids=group_ids,
+    temperature=100.0,
+    n_modes=n_modes,
+    n_q=n_q
 )
+
+# param = reparam.add(
+#     _sc.nomore_u_star,
+#     xs.scatterers(),
+#     (scale0, scale1),
+#     mode_tensors,
+#     initial_frequencies,
+#     group_ids,
+#     100.0,
+#     n_modes,
+#     n_q
+# )
