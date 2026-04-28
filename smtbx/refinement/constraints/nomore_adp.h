@@ -19,9 +19,9 @@ public:
   nomore_u_star(
     af::shared<scatterer_type *> const &scatterers,
     af::shared<independent_scalar_parameter*> const& scale_params,
-    af::const_ref<double> const& mode_tensors_ustar,
-    af::const_ref<double> const& initial_frequencies,
-    af::const_ref<int> const& group_ids,
+    af::shared<double> const& mode_tensors_ustar,
+    af::shared<double> const& initial_frequencies,
+    af::shared<int> const& group_ids,
     double temperature,
     int n_modes,
     int n_q

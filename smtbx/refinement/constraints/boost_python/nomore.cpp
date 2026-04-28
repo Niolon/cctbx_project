@@ -19,9 +19,9 @@ namespace smtbx { namespace refinement { namespace constraints {
           init<
             af::shared<wt::scatterer_type *> const &,
             af::shared<independent_scalar_parameter*> const &, 
-            af::const_ref<double> const &,
-            af::const_ref<double> const &,
-            af::const_ref<int> const &,
+            af::shared<double> const &,
+            af::shared<double> const &,
+            af::shared<int> const &,
             double,
             int,
             int
@@ -41,8 +41,12 @@ namespace smtbx { namespace refinement { namespace constraints {
       }
     };
     void wrap_nomore() {
+      {
+        using namespace scitbx::boost_python::container_conversions;   
+        //tuple_mapping_variable_capacity
+        //  af::shared<independent_scalar_parameter *> >();
+      }
       
-      using namespace scitbx::boost_python::container_conversions;   
       nomore_wrapper::wrap();
     }
   }
