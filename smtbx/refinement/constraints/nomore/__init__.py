@@ -176,11 +176,11 @@ class PhononADPConstraint:
         
         param = reparametrisation.add(
             _sc.nomore_u_star,
-            scatterers= reparametrisation.structure.scatterers(),
-            scale_params = list(self._scale_params),
+            scatterers= tuple(reparametrisation.structure.scatterers()),
+            scale_params = tuple(self._scale_params),
             mode_tensors_ustar = flex.double(self._mode_tensors.tolist()),
-            initial_frequencies = flex.double(self._initial_frequencies_cm1.tolist),
-            group_ids = flex.int(self._groups.group_ids.to_list()),
+            initial_frequencies = flex.double(self._initial_frequencies_cm1.tolist()),
+            group_ids = flex.int(self._groups.group_ids.tolist()),
             temperature = reparametrisation.temperature,
             n_modes=len(self._initial_frequencies_cm1),
             n_q = self.n_q
@@ -243,7 +243,7 @@ class PhononADPConstraint:
         T_p /= masses[np.newaxis, :, np.newaxis, np.newaxis]
 
         mat_f = np.array(matrix.sqr(self._unit_cell.fractionalization_matrix())).reshape(3,3)
-        rf_matrix = np.einsum('kab, bc -> kac', mat_f, R_mats)
+        rf_matrix = np.einsum('ab, kbc -> kac', mat_f, R_mats)
 
         # Rotate to ASU frame and convert to U*: T_r[m,k] = F^T R_k^T @ T_p[m,k] @ R_k F
         T_r = np.einsum('kba,mkbc,kcd->mkad', rf_matrix, T_p, rf_matrix)
