@@ -1,4 +1,4 @@
-. Hpw"""
+"""
 NoMoRe C++ integration tests.
 Run with: libtbx.python tst_nomore.py
 """
@@ -24,27 +24,26 @@ _HBAR           = 1.054571817e-34        # J·s
 _HBAR_C         = _HBAR * _C_CMS        # J·cm
 _KB             = 1.380649e-23           # J/K
 _AMU            = 1.66053906660e-27      # kg
-_HBAR_C_DIV_KB  = _HBAR_C / _KB         # K·cm
+_H_C_DIV_KB     = 2.0 * math.pi * _HBAR_C / _KB   # h·c/k_B = 2π·ħ·c/k_B  (correct BE exponent)
 _U_FACTOR       = _HBAR * 1e20 / (_AMU * 2.0 * math.pi * _C_CMS)
 
 
 def _cpp_amplitude(freq_cm1, temperature):
-    """Replicate the C++ linearise() amplitude calculation."""
-    ex = math.exp(_HBAR_C_DIV_KB * freq_cm1 / temperature)
+    """Replicate the corrected C++ linearise() amplitude: U_FACTOR*(0.5+n)/freq."""
+    x  = _H_C_DIV_KB * freq_cm1 / temperature
+    ex = math.exp(x)
     n  = 1.0 / (ex - 1.0)
-    e  = _HBAR_C * freq_cm1 * (0.5 + n)
-    return e / (freq_cm1 * freq_cm1) * _U_FACTOR
+    return _U_FACTOR * (0.5 + n) / freq_cm1
 
 
 def _cpp_damplitude_dscale(freq_cm1, temperature):
-    """Replicate the C++ da_dscale Jacobian term (at scale=1)."""
-    ex = math.exp(_HBAR_C_DIV_KB * freq_cm1 / temperature)
+    """Replicate the corrected C++ da_dscale Jacobian term (at scale=1)."""
+    x  = _H_C_DIV_KB * freq_cm1 / temperature
+    ex = math.exp(x)
     n  = 1.0 / (ex - 1.0)
-    e  = _HBAR_C * freq_cm1 * (0.5 + n)
-    dn_domega = (_HBAR_C_DIV_KB / temperature) * ex / ((ex - 1.0) ** 2)
-    de_domega = _HBAR_C * (0.5 + n + freq_cm1 * dn_domega)
-    da_domega = -2.0 * e / freq_cm1**3 + de_domega / freq_cm1**2
-    return da_domega * _U_FACTOR * freq_cm1   # domega/dscale = freq_init at scale=1
+    dn_domega = -n * (1.0 + n) * _H_C_DIV_KB / temperature
+    da_domega = _U_FACTOR * (dn_domega / freq_cm1 - (0.5 + n) / freq_cm1**2)
+    return da_domega * freq_cm1   # × domega/dscale = freq_init at scale=1
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +345,51 @@ def test_jacobian_finite_differences():
     print("PASS test_jacobian_finite_differences")
 
 
+def test_amplitude_physical_regression():
+    """
+    Regression: C++ amplitude must match independent scipy.constants reference.
+
+    Uses eigenvector (1,0,0) for a C atom in a cubic 10 Å P1 cell so that
+    T_ustar_11 = 1/(m_AMU * a²) = 1/(12 * 100) and U*_11 has an analytic form.
+
+    The old wrong formula gave results ~3e26× too small (spurious ħ·c factor)
+    and a wrong Bose-Einstein exponent (missing 2π). Both would cause this
+    test to fail with a relative error >> 1e-4.
+    """
+    try:
+        import scipy.constants as sc_const
+    except ImportError:
+        print("SKIP test_amplitude_physical_regression (scipy not available)")
+        return
+
+    xs   = _make_structure()
+    freq = 200.0   # cm⁻¹
+    T    = 300.0   # K
+    t11  = 1.0 / (12.0 * 100.0)   # T_ustar_11 for C atom, a=10 Å
+
+    reparam, _ = _raw_reparam_1mode(xs, freq, T, group_id=0, t11=t11)
+    reparam.linearise()
+    reparam.store()
+    u11_cpp = xs.scatterers()[0].u_star[0]
+
+    # Independent reference using scipy.constants
+    omega   = 2.0 * math.pi * sc_const.c * 100.0 * freq   # rad/s
+    m_kg    = 12.0 * sc_const.atomic_mass                  # kg
+    x       = sc_const.hbar * omega / (sc_const.k * T)
+    n       = 1.0 / (math.exp(x) - 1.0)
+    # U_cart_11 [Å²] = ħ*(0.5+n)/(m*ω) * 1e20
+    # U_star_11 = U_cart_11 / a² (cubic cell, a=10 Å)
+    u11_ref = sc_const.hbar * (0.5 + n) / (m_kg * omega) * 1e20 / (10.0 ** 2)
+
+    rel_err = abs(u11_cpp - u11_ref) / u11_ref
+    assert rel_err < 1e-4, (
+        f"Physical regression FAILED: U*_11={u11_cpp:.6e}, "
+        f"scipy ref={u11_ref:.6e}, rel_err={rel_err:.3e}"
+    )
+    print(f"PASS test_amplitude_physical_regression  "
+          f"(U*_11={u11_cpp:.4e} Å², ref={u11_ref:.4e} Å², rel_err={rel_err:.1e})")
+
+
 def test_n_q_divides_u_star():
     """U* is inversely proportional to n_q."""
     xs   = _make_structure()
@@ -552,25 +596,6 @@ def test_integration_lala_real_data():
         f"Mode tensor array size {mode_tensors_np.size} != {n_modes * n_asu * 6}"
     )
 
-    # Diagnostic: verify mode tensors are non-zero before passing to C++
-    mt_abs_sum = np.abs(mode_tensors_np).sum()
-    print(f"  mode_tensors abs-sum={mt_abs_sum:.4e}, "
-          f"first 6={[f'{v:.3e}' for v in mode_tensors_np[:6]]}")
-
-    # Diagnostic: Python-side expected Ueq for ASU atom 0 (all-in-one group, scale=1)
-    mt_reshaped = mode_tensors_np.reshape(n_modes, n_asu, 6)
-    py_u_stars = np.zeros((n_asu, 6))
-    for im in range(n_modes):
-        amp = _cpp_amplitude(float(c._initial_frequencies_cm1[im]), TEMPERATURE)
-        py_u_stars += amp * mt_reshaped[im] / n_q
-    py_u_cart0 = adptbx.u_star_as_u_cart(unit_cell, tuple(float(v) for v in py_u_stars[0]))
-    py_ueq0 = (py_u_cart0[0] + py_u_cart0[1] + py_u_cart0[2]) / 3.0
-    print(f"  Python-side Ueq(atom 0)={py_ueq0:.5f} Å²")
-
-    # Diagnostic: scatterer u_star BEFORE store()
-    u_star_before = xs.scatterers()[0].u_star
-    print(f"  u_star[0] before store: {tuple(round(v,6) for v in u_star_before)}")
-
     # Build raw C++ reparametrisation with a single all-in-one scale group
     reparam = _sc.ext.reparametrisation(unit_cell)
     sp = reparam.add(_sc.independent_scalar_parameter, value=1.0, variable=True)
@@ -588,9 +613,6 @@ def test_integration_lala_real_data():
     reparam.finalise()
     reparam.linearise()
     reparam.store()
-
-    u_star_after = xs.scatterers()[0].u_star
-    print(f"  u_star[0] after  store: {tuple(round(v,6) for v in u_star_after)}")
 
     # Validate and display results
     print(f"\n  {'Label':>6}  {'Ueq (Å²)':>10}  {'posDef':>6}  Status")
@@ -652,6 +674,7 @@ def run():
     test_scale_changes_u_star()
     test_jacobian_finite_differences()
     test_n_q_divides_u_star()
+    test_amplitude_physical_regression()
 
     print("\n-- Section C: Python/C++ consistency --")
     test_python_tensors_match_analytic()
