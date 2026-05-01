@@ -161,7 +161,7 @@ class PhononADPConstraint:
         if isinstance(self.partition_strategy,
                       (SensitivityBasedStrategy, ThermalCutoffStrategy)):
             self._groups = self.partition_strategy.compute_groups(
-                self.phonon_data, self.temperature)
+                self.phonon_data, self.temperature + 273.15)
         else:
             self._groups = self.partition_strategy.compute_groups(self.phonon_data)
         # Sorted unique active group IDs → determines parameter ordering
@@ -189,7 +189,7 @@ class PhononADPConstraint:
             mode_tensors_ustar = flex.double(self._mode_tensors.tolist()),
             initial_frequencies = flex.double(self._initial_frequencies_cm1.tolist()),
             group_ids = flex.int(self._groups.group_ids.tolist()),
-            temperature = reparametrisation.temperature,
+            temperature = reparametrisation.temperature + 273.15,
             n_modes=len(self._initial_frequencies_cm1),
             n_q = self.n_q
         )
@@ -311,7 +311,7 @@ class PhononADPConstraint:
 
         p1_scatterers = list(p1_structure.scatterers())
         if len(phonon_data.positions_frac) != len(p1_scatterers):
-            logger.warning(
+            print(
                 f"Phonon atoms ({len(phonon_data.positions_frac)}) != P1 atoms "
                 f"({len(p1_scatterers)}). Skipping phonon→P1 mapping."
             )
