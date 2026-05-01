@@ -154,8 +154,16 @@ class PhononADPConstraint:
             self.phonon_data.eigenvectors, self.phonon_data.masses
         )
 
-        # Compute partition groups
-        self._groups = self.partition_strategy.compute_groups(self.phonon_data, self.temperature)
+        # Compute partition groups.
+        # SensitivityBasedStrategy and ThermalCutoffStrategy accept temperature
+        # as their second positional arg; all other strategies use the base
+        # signature compute_groups(phonon_data, pre_groups=None).
+        if isinstance(self.partition_strategy,
+                      (SensitivityBasedStrategy, ThermalCutoffStrategy)):
+            self._groups = self.partition_strategy.compute_groups(
+                self.phonon_data, self.temperature)
+        else:
+            self._groups = self.partition_strategy.compute_groups(self.phonon_data)
         # Sorted unique active group IDs → determines parameter ordering
         self._active_group_ids = np.array(
             sorted(set(self._groups.group_ids[self._groups.group_ids >= 0]))
@@ -256,6 +264,8 @@ class PhononADPConstraint:
 
         i = [0, 1, 2, 0, 0, 1]
         j = [0, 1, 2, 1, 2, 2]
+        #i = [0, 0, 0, 1, 1, 2]
+        #j = [0, 1, 2, 1, 2, 2]
 
         return np.ascontiguousarray(tensors[:,:,i,j].ravel())
 
