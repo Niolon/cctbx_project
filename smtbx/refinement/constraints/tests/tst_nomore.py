@@ -11,7 +11,7 @@ from cctbx.array_family import flex
 from scitbx import matrix
 from libtbx.test_utils import approx_equal
 import smtbx.refinement.constraints as _sc
-from smtbx.refinement.constraints.nomore import PhononADPConstraint
+from smtbx.refinement.constraints.nomore import NoMoReConstraint
 from smtbx.refinement.constraints.nomore.phonon_data import PhononData
 from smtbx.refinement.constraints.nomore.frequency_partition import (
     FrequencyPartitionStrategy, RefinementGroups,
@@ -104,12 +104,12 @@ class _FixedStrategy(FrequencyPartitionStrategy):
 
 def _make_constraint_manual(n_modes=3, freq_cm1=200.0, temperature=300.0,
                              seed=42, strategy=None):
-    """PhononADPConstraint with internal state set directly (no add_to)."""
+    """NoMoReConstraint with internal state set directly (no add_to)."""
     xs = _make_structure()
     pd = _make_phonon_data(n_modes, freq_cm1, seed)
     if strategy is None:
         strategy = _AllInOneStrategy()
-    c = PhononADPConstraint(pd, strategy)
+    c = NoMoReConstraint(pd, strategy)
     c.temperature    = temperature
     c._structure     = xs
     c._unit_cell     = xs.unit_cell()
@@ -176,7 +176,7 @@ def test_mode_tensor_x_eigenvector():
         supercell=(1,1,1), n_atoms=1, degeneracy_groups=None,
     )
     xs = _make_structure()
-    c  = PhononADPConstraint(pd, _AllInOneStrategy())
+    c  = NoMoReConstraint(pd, _AllInOneStrategy())
     c._unit_cell    = xs.unit_cell()
     c._n_asu_atoms  = 1
     c._phonon_to_p1 = np.array([0])
@@ -439,7 +439,7 @@ def test_python_tensors_match_analytic():
         n_atoms=1, degeneracy_groups=None,
     )
     xs = _make_structure()
-    c  = PhononADPConstraint(pd, _AllInOneStrategy())
+    c  = NoMoReConstraint(pd, _AllInOneStrategy())
     c._unit_cell    = xs.unit_cell()
     c._n_asu_atoms  = 1
     c._phonon_to_p1 = np.array([0])
@@ -461,7 +461,7 @@ def test_cpp_u_star_from_python_tensors():
     T    = 300.0
     pd   = _make_phonon_data(n_modes=3, freq_cm1=freq, seed=7)
 
-    c = PhononADPConstraint(pd, _AllInOneStrategy())
+    c = NoMoReConstraint(pd, _AllInOneStrategy())
     c._unit_cell    = xs.unit_cell()
     c._n_asu_atoms  = 1
     c._phonon_to_p1 = np.array([0])
@@ -518,7 +518,7 @@ def test_compute_groups_dispatch():
             n = len(phonon_data.frequencies_cm1)
             return RefinementGroups(np.zeros(n, dtype=int), {0: {}})
 
-    c = PhononADPConstraint(pd, _RecordingStrategy())
+    c = NoMoReConstraint(pd, _RecordingStrategy())
     c.temperature = 300.0
 
     # Replicate the dispatch logic from the fixed add_to()
@@ -566,7 +566,7 @@ def run():
 
     print("\n-- Section D: compute_groups dispatch --")
     test_compute_groups_dispatch()
-    
+
     print("\n" + "=" * 60)
     print("All tests completed.")
     print("=" * 60)

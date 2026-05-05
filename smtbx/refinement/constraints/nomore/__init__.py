@@ -3,7 +3,7 @@ NoMoRe ADP constraint and refinement workflow for smtbx.
 
 Provides two public classes:
 
-    PhononADPConstraint
+    NoMoReConstraint
         Self-contained smtbx-compatible ADP constraint.  Expresses all ASU
         ADPs as functions of partition-group scale factors via the thermal ADP
         equation.  Conforms to the smtbx Python constraint protocol so it can
@@ -11,7 +11,7 @@ Provides two public classes:
         smtbx as a standalone plugin.
 
     NoMoReRefinement
-        Workflow class that wires PhononADPConstraint to smtbx's
+        Workflow class that wires NoMoReConstraint to smtbx's
         crystallographic_ls and exposes compute_gradient() in partition-
         parameter (scale-factor) space directly.
 
@@ -50,7 +50,7 @@ _ACOUSTIC_INIT = 10.0  # cm⁻¹ — initial value for near-zero acoustic branch
 
 # ---------------------------------------------------------------------------
 
-class PhononADPConstraint:
+class NoMoReConstraint:
     """
     smtbx ADP constraint: U_asu = U(partition_scale_factors, phonon_data).
 
@@ -85,9 +85,11 @@ class PhononADPConstraint:
         self,
         phonon_data: PhononData,
         partition_strategy: FrequencyPartitionStrategy,
+        initial_scales: Optional[np.ndarray] = None,
     ) -> None:
         self.phonon_data = phonon_data
         self.partition_strategy = partition_strategy
+        self._initial_scales = np.asarray(initial_scales, dtype=float) if initial_scales is not None else None
 
         frequencies = phonon_data.frequencies_cm1.copy()
         frequencies[frequencies < 10.0] = 10.0
@@ -170,8 +172,16 @@ class PhononADPConstraint:
         )
         self.n_parameters = len(self._active_group_ids)
 
-        # Current scale factors (mutable state, start at 1.0)
-        self.current_scales = np.ones(self.n_parameters)
+        # Current scale factors — warm-start from initial_scales if sizes match
+        if self._initial_scales is not None and len(self._initial_scales) == self.n_parameters:
+            self.current_scales = self._initial_scales.copy()
+        else:
+            if self._initial_scales is not None:
+                print(
+                    f'NoMoRe: stored scales length {len(self._initial_scales)} != '
+                    f'{self.n_parameters} groups; starting from 1.0'
+                )
+            self.current_scales = np.ones(self.n_parameters)
 
         self._scale_params = []
         for _, value in zip(self._active_group_ids, self.current_scales):
@@ -208,9 +218,15 @@ class PhononADPConstraint:
             )
         return freqs
 
+    def get_refined_scales(self) -> np.ndarray:
+        """Return the scale factors as updated by the last refinement cycle."""
+        if not self._scale_params:
+            return self.current_scales.copy()
+        return np.array([p.value for p in self._scale_params])
+
     def current_frequencies(self) -> np.ndarray:
-        """Return current N_modes frequencies implied by current_scales."""
-        return self.scales_to_frequencies(self.current_scales)
+        """Return current N_modes frequencies implied by the last refined scales."""
+        return self.scales_to_frequencies(self.get_refined_scales())
 
     # ------------------------------------------------------------------
     # Internal helpers (self-contained thermal ADP math)
