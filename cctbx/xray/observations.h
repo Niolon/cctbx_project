@@ -65,12 +65,25 @@ namespace cctbx { namespace xray {
         res_filter(res_d_min_ > 0 || res_d_max_ > 0)
       {}
 
+      filter(uctbx::unit_cell const& unit_cell_,
+        sgtbx::space_group const& space_group_,
+        miller::lookup_utils::lookup_tensor<FloatType> const &omit_map,
+        FloatType res_d_min_, FloatType res_d_max_, FloatType min_i_o_sig_)
+        : unit_cell(unit_cell_),
+        space_group(space_group_),
+        omit_map(omit_map),
+        res_d_min(res_d_min_),
+        res_d_max(res_d_max_),
+        min_i_o_sig(min_i_o_sig_),
+        res_filter(res_d_min_ > 0 || res_d_max_ > 0)
+      {}
+
       bool is_to_omit(miller::index<> const& h,
         FloatType f_sq, FloatType sig) const
       {
         if (res_filter) {
           FloatType d = unit_cell.d(h);
-          if (d <= res_d_min || (res_d_max > 0 && d >= res_d_max)) {
+          if ((res_d_min >=0 && d <= res_d_min) || (res_d_max >= 0 && d >= res_d_max)) {
             return true;
           }
         }
@@ -140,7 +153,7 @@ namespace cctbx { namespace xray {
     };
 
     scitbx::af::shared<miller::index<> > indices_;
-    scitbx::af::shared<FloatType> data_, sigmas_;
+    scitbx::af::shared<FloatType> data_, sigmas_, wavelengths_;
     scitbx::af::shared<scitbx::af::shared<local_twin_component> >
       index_components_;
     scitbx::af::shared<twin_component<FloatType>*> merohedral_components_;
@@ -148,6 +161,8 @@ namespace cctbx { namespace xray {
     scitbx::af::shared<int> measured_scale_indices_;
     mutable FloatType prime_fraction_;
     size_t total_data_cnt;
+    // HKLF 2 etc but not HKLF 5/6
+    bool twinned;
 
     miller::index<> generate(scitbx::mat3<FloatType> const& tl,
       miller::index<> const& h) const
@@ -232,6 +247,36 @@ namespace cctbx { namespace xray {
 
   public:
 
+    // hklf 2
+    observations(sgtbx::space_group const& space_group,
+      scitbx::af::shared<miller::index<> > const& indices,
+      scitbx::af::shared<FloatType> const& data,
+      scitbx::af::shared<FloatType> const& sigmas,
+      scitbx::af::shared<int> const& scale_indices,
+      scitbx::af::shared<twin_fraction<FloatType>*> const& twin_fractions,
+      scitbx::af::shared<FloatType> const& wavelengths)
+      : indices_(indices),
+        data_(data),
+        sigmas_(sigmas),
+        wavelengths_(wavelengths),
+        twin_fractions_(twin_fractions),
+        prime_fraction_(1),
+        total_data_cnt(data.size()),
+        twinned(false)
+    {
+      index_components_.reserve(indices.size());
+      for (int i = 0; i < indices.size(); i++) {
+        int s_ind = scale_indices[i];
+        // batches outside the "twin" fractions are just scaled by OSF
+        if (s_ind < 1 || s_ind > twin_fractions.size()+1) {
+          s_ind = 1;
+        }
+        measured_scale_indices_.push_back(s_ind);
+        index_components_.push_back(
+          scitbx::af::shared<local_twin_component>());
+      }
+    }
+
     // hklf 4 + optional merohedral twinning
     observations(sgtbx::space_group const& space_group,
       scitbx::af::shared<miller::index<> > const& indices,
@@ -243,7 +288,8 @@ namespace cctbx { namespace xray {
         data_(data),
         sigmas_(sigmas),
         prime_fraction_(1),
-        total_data_cnt(data.size())
+        total_data_cnt(data.size()),
+        twinned(merohedral_components.size() > 0)
     {
       process_merohedral_components(space_group, merohedral_components);
     }
@@ -256,7 +302,8 @@ namespace cctbx { namespace xray {
       scitbx::af::shared<twin_fraction<FloatType>*> const&
         twin_fractions)
       : twin_fractions_(twin_fractions),
-      total_data_cnt(data.size())
+        total_data_cnt(data.size()),
+        twinned(true)
     {
       build_indices_twin_components(indices, data, sigmas, scale_indices);
       update_prime_fraction();
@@ -275,9 +322,11 @@ namespace cctbx { namespace xray {
       : indices_(obs.indices_),
         data_(obs.data_),
         sigmas_(obs.sigmas_),
+        wavelengths_(obs.wavelengths_),
         measured_scale_indices_(obs.measured_scale_indices_),
         twin_fractions_(twin_fractions),
-        total_data_cnt(obs.total_data_cnt)
+        total_data_cnt(obs.total_data_cnt),
+        twinned(obs.twinned)
     {
       CCTBX_ASSERT(twin_fractions.size()==obs.twin_fractions_.size());
       CCTBX_ASSERT(!(twin_fractions.size() != 0 && merohedral_components.size() != 0));
@@ -289,10 +338,21 @@ namespace cctbx { namespace xray {
       return index_components_.size() != 0;
     }
 
+    bool has_wavelengths() const {
+      return wavelengths_.size() != 0;
+    }
+
+    bool is_twinned() const {
+      return twinned;
+    }
+
     iterator iterate(int i) const { return iterator(*this, i); }
 
     /* must be called before using scale(index) or iterator */
     void update_prime_fraction() const {
+      if (!twinned) {
+        return;
+      }
       FloatType sum=0;
       for (int i = 0; i < twin_fractions_.size(); i++) {
         sum += twin_fractions_[i]->value;
@@ -322,6 +382,9 @@ namespace cctbx { namespace xray {
                       : twin_fractions_[measured_scale_indices_[i]-2]->value;
       return rv;
     }
+
+    FloatType wavelength(int i) const { return wavelengths_[i]; }
+
     const twin_fraction<FloatType>* fraction(int i) const {
       return (measured_scale_indices_.size() == 0 ||
         measured_scale_indices_[i] < 2) ? 0
@@ -445,6 +508,8 @@ namespace cctbx { namespace xray {
     scitbx::af::shared<int> const& measured_scale_indices() const {
       return measured_scale_indices_;
     }
+
+    scitbx::af::shared<FloatType> const& wavelengths() const { return wavelengths_; }
 
     scitbx::af::shared<twin_fraction<FloatType>*> const& twin_fractions() const {
       return twin_fractions_;
